@@ -202,6 +202,12 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
     int_in(data, "concurrency", 1, 16)?;
     int_in(data, "max_requests", 1, 1000)?;
     int_in(data, "queue_capacity", 1, 100000)?;
+    if data
+        .get("busy_input_mode")
+        .is_some_and(|v| !matches!(v.as_str(), Some("queue" | "steer")))
+    {
+        return Err("busy_input_mode must be queue or steer".to_string());
+    }
     if let Some(policy) = data.get("session_reset") {
         if !policy.is_object() {
             return Err("session_reset must be an object".to_string());
@@ -242,6 +248,6 @@ pub fn load_config(path: &Path) -> Result<Value, String> {
 
 /// Validate + atomic save.
 pub fn save_config(path: &Path, data: &Value) -> Result<(), String> {
-    validate_config(&data)?;
+    validate_config(data)?;
     atomic_json(path, data)
 }

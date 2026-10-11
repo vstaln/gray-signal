@@ -65,6 +65,8 @@ struct Daemon {
     aliases: std::sync::RwLock<HashMap<String, String>>,
     /// `gray cmd list` outcome, TTL'd; see commands.rs.
     commands: std::sync::RwLock<crate::commands::ListCache>,
+    acks: crate::busy::Acks,
+    pager: crate::busy::Pager,
 }
 
 /// A parsed inbound message: everything `on_envelope` needs in one place.
@@ -403,11 +405,45 @@ impl Daemon {
             return;
         }
 
+        if let Some(args) = crate::busy::command(&msg.text, "page") {
+            let reply = self
+                .pager
+                .page(&msg.conversation, crate::busy::page_number(args));
+            self.reply(&msg.target, &reply, "page reply").await;
+            return;
+        }
+        let steer = crate::busy::command(&msg.text, "steer").map(str::to_string);
+        if let Some(steer_text) = &steer {
+            if steer_text.is_empty() {
+                self.reply(&msg.target, crate::busy::STEER_USAGE, "steer reply")
+                    .await;
+                return;
+            }
+            if crate::runner::steer(&msg.conversation, steer_text).await {
+                self.reply(&msg.target, crate::busy::STEERING, "steer reply")
+                    .await;
+                return;
+            }
+        }
+
         // Known `!`/`/` commands run through `gray cmd`; text answers
         // inline, prompts enqueue as ordinary turns.
-        if let Some(outcome) = self.command_reply(&msg).await {
+        let outcome = if steer.is_none() {
+            self.command_reply(&msg).await
+        } else {
+            None
+        };
+        if let Some(outcome) = outcome {
             match outcome {
                 crate::commands::Outcome::Text(reply) => {
+                    let reply = if crate::commands::parse_prefixed(&msg.text)
+                        .is_some_and(|(name, _)| name == "help")
+                    {
+                        format!("{reply}{}", crate::busy::help_suffix("/"))
+                    } else {
+                        reply
+                    };
+                    let reply = self.pager.first(&msg.conversation, &reply);
                     self.reply(&msg.target, &reply, "command reply").await;
                 }
                 crate::commands::Outcome::Prompt { prompt, fallback } => {
@@ -442,9 +478,19 @@ impl Daemon {
             return;
         }
 
+        if steer.is_none()
+            && msg.attachments.is_empty()
+            && crate::busy::steer_mode(&self.config)
+            && crate::runner::steer(&msg.conversation, &msg.text).await
+        {
+            self.reply(&msg.target, crate::busy::STEERING, "steer reply")
+                .await;
+            return;
+        }
+
         // Attachments fetch only now: an unadmitted sender cannot make the
         // bot touch the attachment store.
-        let mut prompt = msg.text.clone();
+        let mut prompt = steer.clone().unwrap_or_else(|| msg.text.clone());
         if !msg.attachments.is_empty() {
             let home = crate::session::conversation_home(&self.config_path, &msg.conversation);
             for (i, att) in msg.attachments.iter().enumerate() {
@@ -471,7 +517,21 @@ impl Daemon {
             &prompt,
             capacity,
         ) {
-            Ok(true) => eprintln!("[signal] queued {} from {}", msg.event_id, msg.sender),
+            Ok(true) => {
+                eprintln!("[signal] queued {} from {}", msg.event_id, msg.sender);
+                if steer.is_some() {
+                    self.reply(&msg.target, crate::busy::IDLE_STEER, "steer reply")
+                        .await;
+                } else if let Some(ack) = self.acks.queued(
+                    &msg.conversation,
+                    self.store
+                        .ahead(&msg.conversation, &msg.event_id)
+                        .unwrap_or(0),
+                    crate::store::now_secs(),
+                ) {
+                    self.reply(&msg.target, &ack, "queue ack").await;
+                }
+            }
             Ok(false) => {} // redelivered envelope — already queued or done
             Err(e) => {
                 self.reply(&msg.target, "Queue full; try again later.", "queue notice")
@@ -553,8 +613,8 @@ impl Daemon {
                 }
             }
             Err(RunError::Busy) => {
-                self.store.requeue(&item.id)?;
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.store
+                    .requeue_busy(&item.id, crate::busy::BUSY_RETRY_SECS)?;
             }
             Err(e) => {
                 self.reply(&item.target, &e.to_string(), "error reply")
@@ -674,6 +734,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         home_chat: crate::signal::cfg_str(&config, "home_chat").to_string(),
         aliases: std::sync::RwLock::new(HashMap::new()),
         commands: std::sync::RwLock::new(crate::commands::ListCache::default()),
+        acks: crate::busy::Acks::default(),
+        pager: crate::busy::Pager::new(4000, 60, "/"),
     });
 
     // Boot notice is computed now (it records lifecycle state) and posted

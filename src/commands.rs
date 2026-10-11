@@ -181,6 +181,9 @@ fn parse_list(stdout: &str) -> Option<(HashSet<String>, HashSet<String>)> {
     let mut out = HashSet::new();
     let mut slow = HashSet::new();
     for c in commands {
+        if c.get("source").and_then(Value::as_str) == Some("skill") {
+            continue;
+        }
         let is_slow = c.get("slow").and_then(Value::as_bool).unwrap_or(false);
         if let Some(name) = c.get("name").and_then(Value::as_str) {
             out.insert(name.to_string());

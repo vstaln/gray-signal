@@ -233,7 +233,7 @@ impl Rpc {
             let mut w = self.writer.lock().await;
             w.write_all(line.as_bytes())
                 .await
-                .and_then(|_| std::io::Result::Ok(()))
+                .and(std::io::Result::Ok(()))
         };
         if wrote.is_err() {
             self.pending.lock().ok().and_then(|mut m| m.remove(&id));
