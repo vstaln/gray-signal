@@ -12,6 +12,7 @@
 //! reconnect.
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,10 +45,7 @@ pub enum TransportError {
 
 impl TransportError {
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Net(_) | Self::Timeout | Self::Closed
-        )
+        matches!(self, Self::Net(_) | Self::Timeout | Self::Closed)
     }
 }
 
@@ -295,6 +293,32 @@ impl Rpc {
         Ok(result)
     }
 
+    /// `send` with a file attachment — the tail of long-reply delivery.
+    pub async fn send_file(
+        &self,
+        account: &str,
+        target: &Target,
+        path: &Path,
+        message: &str,
+    ) -> Result<Value, TransportError> {
+        let mut params = json!({
+            "account": account,
+            "message": message,
+            "attachments": [path.to_string_lossy()],
+        });
+        target.route(&mut params);
+        let result = self.call("send", params).await?;
+        if let Some(results) = result.get("results").and_then(Value::as_array) {
+            for r in results {
+                let rtype = r.get("type").and_then(Value::as_str).unwrap_or("");
+                if !rtype.is_empty() && rtype != "SUCCESS" {
+                    return Err(TransportError::Rpc(format!("delivery {rtype}")));
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Typing indicator; `stop` clears it early. Best-effort by callers.
     pub async fn typing(&self, account: &str, target: &Target, stop: bool) {
         let mut params = json!({"account": account});
@@ -376,6 +400,51 @@ pub fn cfg_str<'a>(config: &'a Value, key: &str) -> &'a str {
     config.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+/// Deliver `text` to `target`: consecutive messages up to eight, and past
+/// that the first message plus the whole body as a file attachment. `sent`
+/// counts sends already completed so a retry resumes instead of repeating.
+pub async fn send_long(
+    rpc: &Rpc,
+    account: &str,
+    target: &Target,
+    text: &str,
+    mut sent: usize,
+) -> Result<usize, TransportError> {
+    let chunks = crate::text::split_signal_message(text, MAX_MESSAGE_CHARS);
+    if chunks.is_empty() {
+        return Ok(sent);
+    }
+    if chunks.len() > 8 {
+        if sent == 0 {
+            rpc.send_text(account, target, &chunks[0].0, &chunks[0].1)
+                .await?;
+            sent = 1;
+        }
+        if sent == 1 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path = std::env::temp_dir()
+                .join(format!("gray-signal-{}-{nonce}.txt", std::process::id()));
+            std::fs::write(&path, text)
+                .map_err(|_| TransportError::Invalid("cannot stage file".into()))?;
+            let result = rpc
+                .send_file(account, target, &path, "full reply.txt")
+                .await;
+            let _ = std::fs::remove_file(&path);
+            result?;
+            sent = 2;
+        }
+        return Ok(sent);
+    }
+    for (plain, styles) in chunks.iter().skip(sent) {
+        rpc.send_text(account, target, plain, styles).await?;
+        sent += 1;
+    }
+    Ok(sent)
+}
+
 /// Outbound path for the `signal_send` sidecar tool: connect, convert,
 /// chunk, send, drop. Failures name the caller's input or a category.
 pub async fn standalone_send(
@@ -387,13 +456,6 @@ pub async fn standalone_send(
         .ok_or_else(|| TransportError::Invalid("account is not configured".to_string()))?;
     let target = Target::parse(target_raw)?;
     let rpc = Rpc::from_config(config).await?;
-    let chunks = crate::text::split_signal_message(text, MAX_MESSAGE_CHARS);
-    for (plain, styles) in &chunks {
-        rpc.send_text(&account, &target, plain, styles).await?;
-    }
-    Ok(format!(
-        "Sent {} message(s) to {}.",
-        chunks.len(),
-        target_raw
-    ))
+    let sent = send_long(&rpc, &account, &target, text, 0).await?;
+    Ok(format!("Sent {sent} message(s) to {target_raw}."))
 }

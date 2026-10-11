@@ -322,16 +322,8 @@ impl Daemon {
             return;
         };
         let rpc = self.rpc.read().await;
-        for (plain, styles) in
-            crate::text::split_signal_message(text, crate::signal::MAX_MESSAGE_CHARS)
-        {
-            if let Err(e) = rpc
-                .send_text(&self.own_account, &target, &plain, &styles)
-                .await
-            {
-                log_failure(what, target_raw, &e);
-                return;
-            }
+        if let Err(e) = crate::signal::send_long(&rpc, &self.own_account, &target, text, 0).await {
+            log_failure(what, target_raw, &e);
         }
     }
 
@@ -521,16 +513,22 @@ impl Daemon {
             Ok(answer) => {
                 let chunks =
                     crate::text::split_signal_message(&answer, crate::signal::MAX_MESSAGE_CHARS);
+                let total = if chunks.len() > 8 { 2 } else { chunks.len() };
                 let mut attempts = 0u32;
                 let mut sent = 0usize;
                 'deliver: loop {
-                    let rpc = self.rpc.read().await;
-                    for (plain, styles) in chunks.iter().skip(sent) {
-                        match rpc
-                            .send_text(&self.own_account, &target, plain, styles)
-                            .await
+                    {
+                        let rpc = self.rpc.read().await;
+                        match crate::signal::send_long(
+                            &rpc,
+                            &self.own_account,
+                            &target,
+                            &answer,
+                            sent,
+                        )
+                        .await
                         {
-                            Ok(_) => sent += 1,
+                            Ok(n) => sent = n,
                             Err(e) if e.is_retryable() && attempts < 5 => {
                                 attempts += 1;
                                 drop(rpc);
@@ -548,7 +546,7 @@ impl Daemon {
                             }
                         }
                     }
-                    if sent == chunks.len() {
+                    if sent >= total {
                         self.store.complete(&item.id, &answer)?;
                     }
                     break 'deliver;
