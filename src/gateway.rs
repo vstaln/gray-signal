@@ -63,6 +63,8 @@ struct Daemon {
     home_chat: String,
     /// Observed number<->UUID pairs (both directions).
     aliases: std::sync::RwLock<HashMap<String, String>>,
+    /// `gray cmd list` outcome, TTL'd; see commands.rs.
+    commands: std::sync::RwLock<crate::commands::ListCache>,
 }
 
 /// A parsed inbound message: everything `on_envelope` needs in one place.
@@ -334,6 +336,45 @@ impl Daemon {
         }
     }
 
+    /// Is `name` a real command? The cached registry answers; a stale or
+    /// absent cache costs one `cmd list`, a dead one the static set.
+    async fn command_known(&self, name: &str, home: &Path) -> bool {
+        let now = crate::store::now_secs();
+        let cached = self.commands.read().ok().and_then(|c| {
+            (now - c.fetched_at < crate::commands::LIST_TTL_SECS).then(|| c.names.clone())
+        });
+        let names = match cached {
+            Some(names) => names,
+            None => {
+                let fetched = crate::commands::list_names(&self.config, home).await;
+                if let Ok(mut c) = self.commands.write() {
+                    *c = crate::commands::ListCache {
+                        fetched_at: now,
+                        names: fetched.clone(),
+                    };
+                }
+                fetched
+            }
+        };
+        crate::commands::known(&names, name)
+    }
+
+    /// Run the message as a `!`/`/` command when it names a real one.
+    /// `Some` consumed the message — this is the text to post; `None`
+    /// passes it on to the normal prompt path.
+    async fn command_reply(&self, msg: &Inbound) -> Option<String> {
+        let (name, args) = crate::commands::parse_prefixed(&msg.text)?;
+        let home = crate::session::conversation_home(&self.config_path, &msg.conversation);
+        if !self.command_known(&name, &home).await {
+            return None;
+        }
+        Some(
+            crate::commands::run(&self.config, &home, &name, &args)
+                .await
+                .unwrap_or_else(|e| e),
+        )
+    }
+
     /// One inbound envelope: admission, commands, attachments, enqueue.
     async fn on_envelope(&self, envelope: &Value) {
         let Some(msg) = self.parse(envelope) else {
@@ -357,6 +398,13 @@ impl Daemon {
                 Err(_) => "Could not reset this session.",
             };
             self.reply(&msg.target, note, "reset reply").await;
+            return;
+        }
+
+        // Known `!`/`/` commands run through `gray cmd` and never enqueue;
+        // anything else continues toward the model.
+        if let Some(reply) = self.command_reply(&msg).await {
+            self.reply(&msg.target, &reply, "command reply").await;
             return;
         }
 
@@ -588,6 +636,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         free_groups,
         home_chat: crate::signal::cfg_str(&config, "home_chat").to_string(),
         aliases: std::sync::RwLock::new(HashMap::new()),
+        commands: std::sync::RwLock::new(crate::commands::ListCache::default()),
     });
 
     // Boot notice is computed now (it records lifecycle state) and posted
