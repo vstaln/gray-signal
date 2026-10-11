@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-use crate::signal::{Rpc, Target, TransportError};
 use crate::runner::RunError;
+use crate::signal::{Rpc, Target, TransportError};
 use crate::store::Store;
 
 /// The queue file next to the config.
@@ -199,8 +199,7 @@ impl Daemon {
                 .map(|ms| {
                     ms.iter().any(|m| {
                         m.get("number").and_then(Value::as_str) == Some(&self.own_account)
-                            || m.get("uuid").and_then(Value::as_str)
-                                == Some(&self.own_account)
+                            || m.get("uuid").and_then(Value::as_str) == Some(&self.own_account)
                     })
                 })
                 .unwrap_or(false)
@@ -244,11 +243,8 @@ impl Daemon {
         } else {
             format!("sig:{}", crate::store::uuid_hex())
         };
-        let conversation = crate::session::conversation_key(
-            group_id.as_deref().unwrap_or(""),
-            &sender,
-            !is_group,
-        );
+        let conversation =
+            crate::session::conversation_key(group_id.as_deref().unwrap_or(""), &sender, !is_group);
         Some(Inbound {
             sender: sender.clone(),
             is_admitted: self.user_admitted(&sender),
@@ -329,7 +325,10 @@ impl Daemon {
         for (plain, styles) in
             crate::text::split_signal_message(text, crate::signal::MAX_MESSAGE_CHARS)
         {
-            if let Err(e) = rpc.send_text(&self.own_account, &target, &plain, &styles).await {
+            if let Err(e) = rpc
+                .send_text(&self.own_account, &target, &plain, &styles)
+                .await
+            {
                 log_failure(what, target_raw, &e);
                 return;
             }
@@ -350,28 +349,39 @@ impl Daemon {
                 if let Ok(mut c) = self.commands.write() {
                     *c = crate::commands::ListCache {
                         fetched_at: now,
-                        names: fetched.clone(),
+                        names: fetched.as_ref().map(|f| f.0.clone()),
+                        slow: fetched.as_ref().map(|f| f.1.clone()).unwrap_or_default(),
                     };
                 }
-                fetched
+                fetched.map(|f| f.0)
             }
         };
         crate::commands::known(&names, name)
     }
 
+    /// Whether the cached registry marks `name` slow.
+    fn command_slow(&self, name: &str) -> bool {
+        self.commands
+            .read()
+            .ok()
+            .map(|c| c.slow.contains(name))
+            .unwrap_or(false)
+    }
+
     /// Run the message as a `!`/`/` command when it names a real one.
-    /// `Some` consumed the message — this is the text to post; `None`
-    /// passes it on to the normal prompt path.
-    async fn command_reply(&self, msg: &Inbound) -> Option<String> {
+    /// `Some` consumed the message; `None` passes it on to the normal
+    /// prompt path.
+    async fn command_reply(&self, msg: &Inbound) -> Option<crate::commands::Outcome> {
         let (name, args) = crate::commands::parse_prefixed(&msg.text)?;
         let home = crate::session::conversation_home(&self.config_path, &msg.conversation);
         if !self.command_known(&name, &home).await {
             return None;
         }
+        let slow = self.command_slow(&name);
         Some(
-            crate::commands::run(&self.config, &home, &name, &args)
+            crate::commands::run(&self.config, &home, &name, &args, slow)
                 .await
-                .unwrap_or_else(|e| e),
+                .unwrap_or_else(crate::commands::Outcome::Text),
         )
     }
 
@@ -401,10 +411,42 @@ impl Daemon {
             return;
         }
 
-        // Known `!`/`/` commands run through `gray cmd` and never enqueue;
-        // anything else continues toward the model.
-        if let Some(reply) = self.command_reply(&msg).await {
-            self.reply(&msg.target, &reply, "command reply").await;
+        // Known `!`/`/` commands run through `gray cmd`; text answers
+        // inline, prompts enqueue as ordinary turns.
+        if let Some(outcome) = self.command_reply(&msg).await {
+            match outcome {
+                crate::commands::Outcome::Text(reply) => {
+                    self.reply(&msg.target, &reply, "command reply").await;
+                }
+                crate::commands::Outcome::Prompt { prompt, fallback } => {
+                    let capacity = self
+                        .config
+                        .get("queue_capacity")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1000);
+                    let id = format!("{}:cmd", msg.event_id);
+                    match self.store.enqueue(
+                        &id,
+                        &msg.target,
+                        &msg.sender,
+                        &msg.conversation,
+                        &prompt,
+                        capacity,
+                    ) {
+                        Ok(_) => {
+                            if !fallback.trim().is_empty() {
+                                self.reply(&msg.target, fallback.trim(), "command reply")
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            self.reply(&msg.target, "Queue full; try again later.", "queue notice")
+                                .await;
+                            eprintln!("[signal] command turn enqueue failed: {e}");
+                        }
+                    }
+                }
+            }
             return;
         }
 
@@ -412,8 +454,7 @@ impl Daemon {
         // bot touch the attachment store.
         let mut prompt = msg.text.clone();
         if !msg.attachments.is_empty() {
-            let home =
-                crate::session::conversation_home(&self.config_path, &msg.conversation);
+            let home = crate::session::conversation_home(&self.config_path, &msg.conversation);
             for (i, att) in msg.attachments.iter().enumerate() {
                 if let Some(line) = self.attachment_line(&home, att, i).await {
                     prompt = if prompt.is_empty() {
@@ -478,10 +519,8 @@ impl Daemon {
         }
         match outcome {
             Ok(answer) => {
-                let chunks = crate::text::split_signal_message(
-                    &answer,
-                    crate::signal::MAX_MESSAGE_CHARS,
-                );
+                let chunks =
+                    crate::text::split_signal_message(&answer, crate::signal::MAX_MESSAGE_CHARS);
                 let mut attempts = 0u32;
                 let mut sent = 0usize;
                 'deliver: loop {
@@ -503,8 +542,7 @@ impl Daemon {
                                 if sent == 0 {
                                     self.store.fail(&item.id, "delivery failed")?;
                                 } else {
-                                    self.store
-                                        .fail(&item.id, "delivery partially failed")?;
+                                    self.store.fail(&item.id, "delivery partially failed")?;
                                 }
                                 break 'deliver;
                             }
@@ -521,7 +559,8 @@ impl Daemon {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(e) => {
-                self.reply(&item.target, &e.to_string(), "error reply").await;
+                self.reply(&item.target, &e.to_string(), "error reply")
+                    .await;
                 self.store.fail(&item.id, &e.to_string())?;
             }
         }
@@ -707,7 +746,9 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                 backoff_attempt = 0;
                 if let Some(text) = notice.take() {
                     if !daemon.home_chat.is_empty() {
-                        daemon.reply(&daemon.home_chat.clone(), &text, "boot notice").await;
+                        daemon
+                            .reply(&daemon.home_chat.clone(), &text, "boot notice")
+                            .await;
                     }
                 }
                 break;
@@ -719,7 +760,10 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
                 Err(e) => {
                     let wait = poll_backoff(backoff_attempt);
                     backoff_attempt = backoff_attempt.saturating_add(1);
-                    eprintln!("[signal] connect failed: {e}; retrying in {}s", wait.as_secs());
+                    eprintln!(
+                        "[signal] connect failed: {e}; retrying in {}s",
+                        wait.as_secs()
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {},
                         _ = shutdown.notified() => break 'outer Ok(()),

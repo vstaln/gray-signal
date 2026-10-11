@@ -14,14 +14,17 @@ use std::time::Duration;
 pub const LIST_TTL_SECS: f64 = 300.0;
 /// `run` is local work; bound it far below a model turn.
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Registry rows marked `slow` get this window instead.
+const SLOW_TIMEOUT: Duration = Duration::from_secs(120);
 /// `list` only feeds the allowlist — fail fast and fall back.
 const LIST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The commands trusted when `gray cmd list` cannot be asked: the
 /// contract's v1 text/interactive coverage. Anything `run` still rejects
 /// comes back as its own error reply.
-const FALLBACK_COMMANDS: &[&str] =
-    &["help", "model", "usage", "new", "sessions", "cron", "skills"];
+const FALLBACK_COMMANDS: &[&str] = &[
+    "help", "model", "usage", "new", "sessions", "cron", "skills",
+];
 
 /// The last `cmd list` outcome. `names: None` remembers a *failed* fetch —
 /// the stamp is honored either way so a gray without `cmd` does not cost a
@@ -30,6 +33,8 @@ const FALLBACK_COMMANDS: &[&str] =
 pub struct ListCache {
     pub fetched_at: f64,
     pub names: Option<HashSet<String>>,
+    /// Names (and aliases) whose runs can outlast RUN_TIMEOUT.
+    pub slow: HashSet<String>,
 }
 
 /// `!<name> <args>` or `/<name> <args>` as the whole (trimmed) message.
@@ -68,22 +73,38 @@ pub fn known(names: &Option<HashSet<String>>, name: &str) -> bool {
     }
 }
 
-/// `cmd list` -> registered names plus aliases; `None` on any failure.
-pub async fn list_names(config: &Value, home: &Path) -> Option<HashSet<String>> {
+/// `cmd list` -> registered names plus aliases and the slow set; `None`
+/// on any failure.
+pub async fn list_names(config: &Value, home: &Path) -> Option<(HashSet<String>, HashSet<String>)> {
     let out = gray_cmd(config, home, &["cmd", "list"], LIST_TIMEOUT)
         .await
         .ok()?;
     parse_list(&out)
 }
 
-/// `cmd run` -> the reply text. `Err` strings are already chat-safe.
-pub async fn run(config: &Value, home: &Path, name: &str, args: &str) -> Result<String, String> {
+/// What a `cmd run` answer becomes: reply text, or a prompt the caller
+/// queues as a turn in this conversation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Text(String),
+    Prompt { prompt: String, fallback: String },
+}
+
+/// `cmd run` -> the reply. `Err` strings are already chat-safe.
+pub async fn run(
+    config: &Value,
+    home: &Path,
+    name: &str,
+    args: &str,
+    slow: bool,
+) -> Result<Outcome, String> {
     // v1 exposes one free-form args string per command — keep it one word.
     let mut argv = vec!["cmd", "run", name];
     if !args.is_empty() {
         argv.push(args);
     }
-    let out = gray_cmd(config, home, &argv, RUN_TIMEOUT).await?;
+    let timeout = if slow { SLOW_TIMEOUT } else { RUN_TIMEOUT };
+    let out = gray_cmd(config, home, &argv, timeout).await?;
     result_text(&out)
 }
 
@@ -107,11 +128,10 @@ async fn gray_cmd(
         .map_err(|_| "cannot create conversation home".to_string())?;
     // Conversation-scoped commands read the home's config.json — snapshot
     // the provider config exactly like a turn would before trusting it.
-    if let Some(provider) = std::fs::read(
-        Path::new(crate::signal::cfg_str(config, "gray_home")).join("config.json"),
-    )
-    .ok()
-    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    if let Some(provider) =
+        std::fs::read(Path::new(crate::signal::cfg_str(config, "gray_home")).join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
     {
         crate::config::atomic_json(&home.join("config.json"), &provider)?;
     }
@@ -150,32 +170,40 @@ async fn gray_cmd(
     String::from_utf8(out.stdout).map_err(|_| "gray answered with invalid output".to_string())
 }
 
-/// `cmd list` stdout -> the name set; `None` when the answer is not an
-/// `ok` envelope carrying a `commands` array.
-fn parse_list(stdout: &str) -> Option<HashSet<String>> {
+/// `cmd list` stdout -> (name set, slow set); `None` when the answer is
+/// not an `ok` envelope carrying a `commands` array.
+fn parse_list(stdout: &str) -> Option<(HashSet<String>, HashSet<String>)> {
     let v: Value = serde_json::from_str(stdout.trim()).ok()?;
     if v.get("ok") != Some(&Value::Bool(true)) {
         return None;
     }
     let commands = v.pointer("/result/commands")?.as_array()?;
     let mut out = HashSet::new();
+    let mut slow = HashSet::new();
     for c in commands {
+        let is_slow = c.get("slow").and_then(Value::as_bool).unwrap_or(false);
         if let Some(name) = c.get("name").and_then(Value::as_str) {
             out.insert(name.to_string());
+            if is_slow {
+                slow.insert(name.to_string());
+            }
         }
         if let Some(aliases) = c.get("aliases").and_then(Value::as_array) {
             for a in aliases.iter().filter_map(Value::as_str) {
                 out.insert(a.to_string());
+                if is_slow {
+                    slow.insert(a.to_string());
+                }
             }
         }
     }
-    Some(out)
+    Some((out, slow))
 }
 
 /// `cmd run` stdout -> the text to post. Signal renders `kind:"ui"`
 /// results through `fallback_text` (the component-less render), `kind:
 /// "text"` through `text`; `ok:false` becomes its own error message.
-fn result_text(stdout: &str) -> Result<String, String> {
+fn result_text(stdout: &str) -> Result<Outcome, String> {
     let v: Value = serde_json::from_str(stdout.trim())
         .map_err(|_| "gray answered with invalid output; upgrade gray".to_string())?;
     if v.get("ok") != Some(&Value::Bool(true)) {
@@ -186,6 +214,23 @@ fn result_text(stdout: &str) -> Result<String, String> {
             .to_string());
     }
     let result = v.get("result").cloned().unwrap_or(Value::Null);
+    if result.get("kind").and_then(Value::as_str) == Some("prompt") {
+        let prompt = result
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if prompt.is_empty() {
+            return Err("the command returned an empty prompt".to_string());
+        }
+        let fallback = result
+            .get("fallback_text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return Ok(Outcome::Prompt { prompt, fallback });
+    }
     let text = match result.get("kind").and_then(Value::as_str) {
         Some("text") => result.get("text"),
         Some("ui") => result.get("fallback_text"),
@@ -194,6 +239,7 @@ fn result_text(stdout: &str) -> Result<String, String> {
     text.and_then(Value::as_str)
         .map(str::to_string)
         .filter(|t| !t.trim().is_empty())
+        .map(Outcome::Text)
         .ok_or_else(|| "the command returned nothing".to_string())
 }
 
@@ -268,11 +314,12 @@ mod tests {
             {"name":"model","description":"pick model","aliases":[],
              "args":[{"name":"args","required":false,"hint":"model id"}],
              "scope":"conversation","surface":"interactive"}]}}"#;
-        let names = parse_list(fixture).expect("fixture parses");
+        let (names, slow) = parse_list(fixture).expect("fixture parses");
         for want in ["help", "h", "?", "model"] {
             assert!(names.contains(want), "{want}");
         }
         assert!(!names.contains("usage"));
+        assert!(slow.is_empty());
     }
 
     #[test]
@@ -287,16 +334,18 @@ mod tests {
 
     #[test]
     fn run_fixture_maps_result_kinds() {
-        assert_eq!(
-            result_text(r#"{"ok":true,"result":{"kind":"text","text":"**hi** there","close":true}}"#),
-            Ok("**hi** there".to_string())
-        );
-        assert_eq!(
-            result_text(
-                r#"{"ok":true,"result":{"kind":"ui","token":"t","document":{},"fallback_text":"pick 1-3"}}"#
-            ),
-            Ok("pick 1-3".to_string())
-        );
+        match result_text(
+            r#"{"ok":true,"result":{"kind":"text","text":"**hi** there","close":true}}"#,
+        ) {
+            Ok(Outcome::Text(t)) => assert_eq!(t, "**hi** there"),
+            other => panic!("expected text: {other:?}"),
+        }
+        match result_text(
+            r#"{"ok":true,"result":{"kind":"ui","token":"t","document":{},"fallback_text":"pick 1-3"}}"#,
+        ) {
+            Ok(Outcome::Text(t)) => assert_eq!(t, "pick 1-3"),
+            other => panic!("expected text: {other:?}"),
+        }
         assert_eq!(
             result_text(
                 r#"{"ok":false,"error":{"code":"local_only","message":"theme is TUI-only","retryable":false}}"#
@@ -304,10 +353,9 @@ mod tests {
             Err("theme is TUI-only".to_string())
         );
         // A ui result Signal cannot render falls back to an error.
-        assert!(result_text(
-            r#"{"ok":true,"result":{"kind":"ui","token":"t","document":{}}}"#
-        )
-        .is_err());
+        assert!(
+            result_text(r#"{"ok":true,"result":{"kind":"ui","token":"t","document":{}}}"#).is_err()
+        );
         assert!(result_text(r#"{"ok":true,"result":{"kind":"text","text":"  "}}"#).is_err());
         assert!(result_text("garbage").is_err());
     }
