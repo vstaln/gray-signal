@@ -81,6 +81,7 @@ The service probes what this box actually supervises with (runit,
   `@+15551234567 your message`.
 - `/new` or `/reset` starts a fresh session for that chat.
 - `/steer <text>` adds guidance to the turn already running in that conversation ("Steering the current turn."); with nothing running it is sent as a new message.
+- `/stop` (or `!stop`) cancels the turn running in that conversation ("Stopped."); queued messages still run next. With nothing running it answers "Nothing running."
 - Messages sent while a turn runs queue as their own next turn ("Queued — N ahead.", at most once per 30s). Set `busy_input_mode: "steer"` in the config to steer the running turn instead.
 - Long command output is paged: page 1 ends with `page 1/N — /page 2`; `/page N` shows page N of the conversation's last paged output.
 - A DM from a number that is not allowlisted gets a one-shot pairing code;

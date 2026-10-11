@@ -412,6 +412,14 @@ impl Daemon {
             self.reply(&msg.target, &reply, "page reply").await;
             return;
         }
+        if crate::busy::command(&msg.text, "stop").is_some() {
+            let reply = match self.store.cancel_conversation(&msg.conversation) {
+                Ok(true) => crate::busy::STOPPED,
+                _ => crate::busy::NOTHING_RUNNING,
+            };
+            self.reply(&msg.target, reply, "stop reply").await;
+            return;
+        }
         let steer = crate::busy::command(&msg.text, "steer").map(str::to_string);
         if let Some(steer_text) = &steer {
             if steer_text.is_empty() {
@@ -557,18 +565,25 @@ impl Daemon {
             let rpc = self.rpc.read().await;
             rpc.typing(&self.own_account, &target, false).await;
         }
-        let outcome = crate::runner::run_gray(
-            &self.config,
-            &self.config_path,
-            &item.conversation,
-            &item.text,
-            None,
+        let outcome = crate::busy::cancellable(
+            crate::runner::run_gray(
+                &self.config,
+                &self.config_path,
+                &item.conversation,
+                &item.text,
+                None,
+            ),
+            || self.store.cancel_requested(&item.id).unwrap_or(false),
         )
         .await;
         {
             let rpc = self.rpc.read().await;
             rpc.typing(&self.own_account, &target, true).await;
         }
+        let Some(outcome) = outcome else {
+            self.store.mark_cancelled(&item.id)?;
+            return Ok(true);
+        };
         match outcome {
             Ok(answer) => {
                 let chunks =
