@@ -11,9 +11,10 @@ const LINE_CAP: usize = 1024 * 1024;
 #[derive(Debug, Clone)]
 pub enum RunError {
     Busy,
-    Timeout,
+    Timeout(u64),
     /// The turn used all `max_requests` provider requests and was stopped.
     RequestLimit(u64),
+    Agent(String),
     Spawn(String),
     Protocol(String),
     Exit(Option<i32>),
@@ -26,28 +27,44 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Busy => f.write_str("This conversation is busy"),
-            Self::Timeout => f.write_str("gray turn timed out"),
+            Self::Timeout(secs) => write!(f, "the agent did not answer within {secs} seconds"),
             Self::RequestLimit(n) => write!(f, "gray turn hit its {n}-request limit"),
+            Self::Agent(message) => f.write_str(message),
             Self::Spawn(_) => f.write_str("cannot start gray agent"),
             Self::Protocol(_) => {
-                f.write_str("Invalid agent JSON output; upgrade gray to a compatible version")
+                f.write_str("gray's output was unreadable; upgrade gray to a compatible version")
             }
-            Self::Exit(Some(n)) => write!(
-                f,
-                "gray exited with code {n}; not retrying possible side effects"
-            ),
-            Self::Exit(None) => {
-                f.write_str("gray exited without a status; not retrying possible side effects")
-            }
-            Self::Incomplete => f.write_str(
-                "Agent did not return a completed result; actions may already have occurred",
-            ),
-            Self::Empty => f.write_str("Agent returned no final answer"),
-            Self::Io(_) => f.write_str("gray turn failed; check connectivity"),
+            Self::Exit(Some(n)) => write!(f, "gray exited with code {n}"),
+            Self::Exit(None) => f.write_str("gray exited without a status"),
+            Self::Incomplete => f.write_str("the agent did not return a completed result"),
+            Self::Empty => f.write_str("the agent returned no final answer"),
+            Self::Io(detail) => f.write_str(detail),
         }
     }
 }
 impl std::error::Error for RunError {}
+
+pub fn failure_notice(err: &RunError) -> String {
+    let lead = match err {
+        RunError::Timeout(_) => "Gave up",
+        RunError::RequestLimit(_) => "Stopped",
+        _ => "That failed",
+    };
+    let reason = one_line(&err.to_string());
+    format!(
+        "{lead}: {}. Some steps may already have run. Send a message to try again.",
+        reason.trim_end_matches('.')
+    )
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(300)
+        .collect()
+}
 
 struct Consume {
     terminal: Option<Value>,
@@ -243,10 +260,17 @@ pub async fn run_gray(
         .get("gray_home")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let provider: Value = std::fs::read(Path::new(gray_home).join("config.json"))
+    let mut provider: Value = std::fs::read(Path::new(gray_home).join("config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| RunError::Io("gray provider configuration is missing".to_string()))?;
+    if let Some(model) = config
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|m| !m.trim().is_empty())
+    {
+        provider["model"] = Value::String(model.to_string());
+    }
     crate::config::atomic_json(&home.join("config.json"), &provider).map_err(RunError::Io)?;
 
     // Dedicated workdir/profile: the signal tools plus the minimal builtin
@@ -369,13 +393,18 @@ pub async fn run_gray(
     cmd.env_clear();
     for (k, v) in std::env::vars_os() {
         let Some(k_str) = k.to_str() else { continue };
-        if k_str.starts_with("GRAY_") || k_str.starts_with("SIGNAL_") || k_str.starts_with("OPENAI_")
+        if k_str.starts_with("GRAY_")
+            || k_str.starts_with("SIGNAL_")
+            || k_str.starts_with("OPENAI_")
         {
             continue;
         }
         cmd.env(k, v);
     }
     cmd.env("GRAY_HOME", &home);
+    if !gray_home.is_empty() {
+        cmd.env("GRAY_USER_HOME", gray_home);
+    }
     cmd.env(
         "PATH",
         child_path(
@@ -414,7 +443,7 @@ pub async fn run_gray(
                 }
                 let _ = child.wait().await;
                 group.0 = 0;
-                return Err(RunError::Timeout);
+                return Err(RunError::Timeout(timeout_secs));
             }
         };
     let status = child.wait().await;
@@ -427,6 +456,13 @@ pub async fn run_gray(
     if let Some(row) = consumed.terminal.as_ref().filter(|r| r["type"] == "error") {
         if row["accounting"]["requests"].as_u64() >= Some(max_requests) {
             return Err(RunError::RequestLimit(max_requests));
+        }
+        if let Some(message) = row
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|m| !m.trim().is_empty())
+        {
+            return Err(RunError::Agent(message.to_string()));
         }
     }
     if !status.success() {

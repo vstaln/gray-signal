@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-use crate::runner::RunError;
+use crate::runner::{failure_notice, RunError};
 use crate::signal::{Rpc, Target, TransportError};
 use crate::store::Store;
 
@@ -632,7 +632,7 @@ impl Daemon {
                     .requeue_busy(&item.id, crate::busy::BUSY_RETRY_SECS)?;
             }
             Err(e) => {
-                self.reply(&item.target, &e.to_string(), "error reply")
+                self.reply(&item.target, &failure_notice(&e), "error reply")
                     .await;
                 self.store.fail(&item.id, &e.to_string())?;
             }
