@@ -6,8 +6,9 @@
 //! itself reports whatever is still broken.
 use serde_json::Value;
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 /// `gray cmd list` is re-asked at most this often.
@@ -121,9 +122,13 @@ async fn gray_cmd(
     if gray_bin.is_empty() {
         return Err("gray executable is missing".to_string());
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        builder.mode(0o700);
+    }
+    builder
         .create(home)
         .map_err(|_| "cannot create conversation home".to_string())?;
     // Conversation-scoped commands read the home's config.json — snapshot
@@ -163,7 +168,7 @@ async fn gray_cmd(
         "PATH",
         crate::runner::child_path(
             std::env::var_os("PATH"),
-            std::env::var_os("HOME").map(PathBuf::from),
+            crate::config::user_home(),
             Path::new(gray_bin),
         ),
     );
