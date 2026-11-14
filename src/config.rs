@@ -88,10 +88,7 @@ fn int_in(data: &Value, key: &str, low: u64, high: u64) -> Result<(), String> {
 /// A phone number in E.164 form: `+` then 5-15 digits.
 pub fn number_valid(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() >= 6
-        && b.len() <= 16
-        && b[0] == b'+'
-        && b[1..].iter().all(|c| c.is_ascii_digit())
+    b.len() >= 6 && b.len() <= 16 && b[0] == b'+' && b[1..].iter().all(|c| c.is_ascii_digit())
 }
 
 /// A Signal service id: a UUID, optionally `uuid:`-prefixed (ACI/PNI).
@@ -126,9 +123,9 @@ pub fn group_valid(v: &Value) -> bool {
             let id = s.strip_prefix("group:").unwrap_or(s);
             !id.is_empty()
                 && id.len() <= 128
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
+                && id.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_')
+                })
         }
         None => false,
     }
@@ -186,11 +183,7 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
     // yet — every DM then gets a pairing reply), but it must be an array.
     match data.get("allowed_numbers").and_then(Value::as_array) {
         Some(a) if a.iter().all(identity_valid) => {}
-        _ => {
-            return Err(
-                "allowed_numbers must be an array of +E164 numbers or UUIDs".to_string(),
-            )
-        }
+        _ => return Err("allowed_numbers must be an array of +E164 numbers or UUIDs".to_string()),
     }
     if let Some(groups) = data.get("allowed_groups") {
         let ok = groups.as_array().is_some_and(|a| a.iter().all(group_valid));
@@ -203,10 +196,7 @@ pub fn validate_config(data: &Value) -> Result<(), String> {
             return Err("home_chat must be a number, UUID, or group:<id>".to_string());
         }
     }
-    if data
-        .get("require_mention")
-        .is_some_and(|v| !v.is_boolean())
-    {
+    if data.get("require_mention").is_some_and(|v| !v.is_boolean()) {
         return Err("require_mention must be true or false".to_string());
     }
     for key in ["gray_bin", "gray_home", "workdir"] {

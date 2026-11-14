@@ -117,7 +117,9 @@ pub fn register(config: &Value, config_path: &Path) -> Result<(), String> {
         Value::String("--config".to_string()),
         Value::String(resolved),
     ];
-    let prev_exe = data.pointer("/plugins/signal/argv/0").and_then(Value::as_str);
+    let prev_exe = data
+        .pointer("/plugins/signal/argv/0")
+        .and_then(Value::as_str);
     if prev_exe.is_some_and(|p| p != exe && Path::new(p).is_file()) {
         return Err("Another signal plugin is registered; refusing to overwrite it".to_string());
     }
@@ -195,7 +197,10 @@ fn queue(action: &QueueAction, config_path: &Path) -> Result<(), String> {
             }
             for i in items {
                 let text: String = i.text.chars().take(24).collect();
-                println!("{} [{}] {} {} ({}…)", i.id, i.state, i.target, i.sender, text);
+                println!(
+                    "{} [{}] {} {} ({}…)",
+                    i.id, i.state, i.target, i.sender, text
+                );
             }
             Ok(())
         }
@@ -265,7 +270,9 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 .filter(|c| {
                     !c.is_hide_set() && !["run", "sidecar", "register"].contains(&c.get_name())
                 })
-                .map(|c| Value::String(c.get_name().to_string()))
+                .map(
+                    |c| json!({"arg": c.get_name(), "description": verb_description(c.get_name())}),
+                )
                 .collect();
             m["sidecar_args"] = serde_json::json!(["sidecar"]);
             println!("{m}");
@@ -377,5 +384,22 @@ pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
                 Ok(())
             }
         },
+    }
+}
+
+fn verb_description(verb: &str) -> &'static str {
+    match verb {
+        "setup" => "connect the app: credentials, owner, home chat",
+        "install" => "install and start the background service",
+        "status" => "is the transport running",
+        "stop" => "stop the background service",
+        "restart" => "restart the background service",
+        "doctor" => "diagnose a broken setup",
+        "uninstall" => "remove the service, keep the config",
+        "limits" => "timeouts, concurrency and request caps",
+        "queue" => "inspect or drop queued sends",
+        "allowlist" => "who may talk to the bot",
+        "pairing" => "approve a direct-message pairing",
+        _ => "",
     }
 }

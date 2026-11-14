@@ -308,7 +308,11 @@ pub async fn run(path: &Path, io: &mut dyn Prompter) -> Result<bool, String> {
         .version()
         .await
         .ok()
-        .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.get("version").and_then(Value::as_str).map(str::to_string)))
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.get("version").and_then(Value::as_str).map(str::to_string))
+        })
         .unwrap_or_else(|| "unknown".to_string());
     io.print_line(&format!("signal-cli {version} reachable."));
 
@@ -349,9 +353,8 @@ pub async fn run(path: &Path, io: &mut dyn Prompter) -> Result<bool, String> {
         return Err("Allowed senders must be +E164 numbers or UUIDs".to_string());
     }
 
-    let home_answer = io.prompt(
-        "Home chat for lifecycle notices (number, UUID, or group:<id>) [none]: ",
-    )?;
+    let home_answer =
+        io.prompt("Home chat for lifecycle notices (number, UUID, or group:<id>) [none]: ")?;
     let home_chat = home_answer.trim().to_string();
     if !home_chat.is_empty() && !crate::config::target_valid(&Value::String(home_chat.clone())) {
         return Err("Home chat must be a number, UUID, or group:<id>".to_string());
@@ -395,8 +398,7 @@ pub async fn run(path: &Path, io: &mut dyn Prompter) -> Result<bool, String> {
         saved["home_chat"] = Value::String(home_chat);
     }
     if !groups.is_empty() {
-        saved["allowed_groups"] =
-            Value::Array(groups.into_iter().map(Value::String).collect());
+        saved["allowed_groups"] = Value::Array(groups.into_iter().map(Value::String).collect());
     }
     // A re-run replaces only what the wizard asked about: limits and other
     // hand-tuned keys survive (unless they no longer validate).
