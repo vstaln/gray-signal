@@ -11,6 +11,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
         "requires_plugins": ["gateway"],
+        "description": "send and read Signal messages",
         "commands": ["/signal"],
         "command_descriptions": {"/signal": "set up and manage the Signal gateway"},
         "hooks": ["prompt/context"],

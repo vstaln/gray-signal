@@ -86,8 +86,7 @@ pub fn approve(config_path: &Path, platform: &str, code: &str) -> Result<String,
         return Ok(format!("{identity} was already allowed"));
     }
     allowed.push(identity.clone());
-    config["allowed_numbers"] =
-        Value::Array(allowed.into_iter().map(Value::String).collect());
+    config["allowed_numbers"] = Value::Array(allowed.into_iter().map(Value::String).collect());
     crate::config::save_config(config_path, &config)?;
     Ok(format!(
         "{identity} can now trigger the bot; restart the gateway to apply (it re-reads on start)"

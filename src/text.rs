@@ -261,8 +261,7 @@ fn find_inline_matches(chars: &[char]) -> Vec<InlineMatch> {
 
 fn find_delim(chars: &[char], from: usize, delim: &str) -> Option<usize> {
     let d: Vec<char> = delim.chars().collect();
-    (from..=chars.len().saturating_sub(d.len()))
-        .find(|&i| chars[i..i + d.len()] == d[..])
+    (from..=chars.len().saturating_sub(d.len())).find(|&i| chars[i..i + d.len()] == d[..])
 }
 
 /// Strip inline markers. Returns (plain, inline styles in UTF-16 over
